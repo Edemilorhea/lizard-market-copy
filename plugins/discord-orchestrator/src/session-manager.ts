@@ -39,9 +39,10 @@ export class SessionManager {
     try {
       const { client, server } = await createOpencode({
         hostname: "127.0.0.1",
-        port: 14096,
+        port: 0, // 使用動態 port,避免衝突
         config: {
           model: "anthropic/claude-sonnet-4-6",
+          password: process.env.OPENCODE_SERVER_PASSWORD || "discord-orchestrator-projects",
         },
       });
       this.opencodeClient = client;
@@ -52,6 +53,7 @@ export class SessionManager {
       await this.startEventListener();
     } catch (error: any) {
       console.error("[session-manager] Failed to initialize OpenCode SDK:", error.message);
+      console.error("[session-manager] Full error:", error);
       throw error;
     }
   }

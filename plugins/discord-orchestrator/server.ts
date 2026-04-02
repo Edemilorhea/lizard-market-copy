@@ -51,9 +51,10 @@ console.log("[orchestrator] Initializing OpenCode SDK for Ops mode...");
 try {
   const { client, server } = await createOpencode({
     hostname: "127.0.0.1",
-    port: 14097, // 不同的 port,避免與 SessionManager 衝突
+    port: 0, // 使用動態 port,避免衝突
     config: {
       model: "anthropic/claude-sonnet-4-6",
+      password: process.env.OPENCODE_SERVER_PASSWORD || "discord-orchestrator-ops",
     },
   });
   opsClient = client;
@@ -61,6 +62,7 @@ try {
   console.log(`[orchestrator] Ops OpenCode server started at ${server.url}`);
 } catch (error: any) {
   console.error("[orchestrator] Failed to initialize Ops OpenCode SDK:", error.message);
+  console.error("[orchestrator] Full error:", error);
   process.exit(1);
 }
 

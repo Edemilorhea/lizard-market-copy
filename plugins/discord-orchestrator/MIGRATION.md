@@ -13,7 +13,8 @@
 #### **SessionManager (`src/session-manager.ts`)**
 - **舊**: 每次 `query()` 返回獨立串流
 - **新**: 共用 OpenCode server + 全域事件監聽器
-- **Port**: 14096 (專案模式)
+- **Port**: 動態分配 (使用 `port: 0`)
+- **密碼**: 從環境變數 `OPENCODE_SERVER_PASSWORD` 讀取,預設 `discord-orchestrator-projects`
 - **關鍵改變**:
   - 使用 `createOpencode()` 初始化共用 server
   - 透過 `client.event.subscribe()` 接收所有 session 的事件
@@ -23,7 +24,8 @@
 #### **Server (`server.ts` - Ops 模式)**
 - **舊**: 使用 Claude SDK 的 `query()` + `resume`
 - **新**: 獨立 OpenCode client with separate server
-- **Port**: 14097 (Ops 模式)
+- **Port**: 動態分配 (使用 `port: 0`)
+- **密碼**: 從環境變數 `OPENCODE_SERVER_PASSWORD` 讀取,預設 `discord-orchestrator-ops`
 - **關鍵改變**:
   - 用 `session.create()` 建立 Ops session
   - 用 `session.prompt()` 發送訊息
@@ -50,9 +52,15 @@ bun x tsc --noEmit --skipLibCheck
 
 ### **3. 配置環境**
 確保 `~/.discord-orchestrator/.env` 包含:
-```
+```bash
 DISCORD_BOT_TOKEN=your-bot-token-here
+
+# Optional: 設置 OpenCode server 密碼
+# 如果不設置,會使用預設密碼
+OPENCODE_SERVER_PASSWORD=your-secure-password
 ```
+
+**注意**: OpenCode SDK 需要設置密碼,否則會顯示警告。建議在生產環境設置強密碼。
 
 ### **4. 配置專案**
 確保 `~/.discord-orchestrator/projects.json` 格式正確:
@@ -77,17 +85,19 @@ bun server.ts
 
 預期輸出:
 ```
-[session-manager] Initializing OpenCode SDK...
-[session-manager] OpenCode server started at http://127.0.0.1:14096
-[session-manager] Starting global event listener...
-[orchestrator] Initializing OpenCode SDK for Ops mode...
-[orchestrator] Ops OpenCode server started at http://127.0.0.1:14097
 [orchestrator] API server on http://127.0.0.1:XXXXX
+[orchestrator] Initializing OpenCode SDK for Ops mode...
+[orchestrator] Ops OpenCode server started at http://127.0.0.1:XXXXX
 [orchestrator] Starting...
+[session-manager] Initializing OpenCode SDK...
+[session-manager] OpenCode server started at http://127.0.0.1:XXXXX
+[session-manager] Starting global event listener...
 [orchestrator] Bot ready as YourBot#1234
 [orchestrator] 1 projects registered
 [orchestrator] Ops channel: 1234567890
 ```
+
+**注意**: Port 號碼是動態分配的,每次啟動可能不同。
 
 ### **6. 測試專案模式**
 1. 在綁定的專案頻道發送訊息: `Hello, can you help me?`
@@ -147,22 +157,39 @@ OpenCode SDK 的錯誤格式可能與 Claude SDK 不同,需要測試各種錯誤
 
 ## 🐛 故障排除
 
-### **Port 已被佔用**
+### **Port 已被佔用 (已修復)**
+**問題**: 
 ```
 Error: listen EADDRINUSE: address already in use 127.0.0.1:14096
+Failed to start server on port 14097
 ```
+
 **解決方案**:
-- 檢查其他 OpenCode 實例: `lsof -i :14096` (Linux/Mac) 或 `netstat -ano | findstr 14096` (Windows)
-- 終止衝突進程或修改 `port` 配置
+現在使用動態 port (`port: 0`),不再有 port 衝突問題。
+
+### **OPENCODE_SERVER_PASSWORD 警告**
+**問題**:
+```
+Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.
+```
+
+**解決方案**:
+在 `~/.discord-orchestrator/.env` 添加:
+```bash
+OPENCODE_SERVER_PASSWORD=your-secure-password
+```
+
+或接受使用預設密碼 (開發環境可接受)。
 
 ### **OpenCode SDK 初始化失敗**
 ```
 [session-manager] Failed to initialize OpenCode SDK: ...
 ```
 **解決方案**:
-- 確認已安裝 `@opencode-ai/sdk`
-- 檢查網路連線
-- 查看完整錯誤訊息
+1. 確認已安裝 `@opencode-ai/sdk`
+2. 檢查日誌: `C:\Users\TC\.local\share\opencode\log\`
+3. 確認沒有其他 OpenCode 進程干擾
+4. 查看完整錯誤訊息 (現在會輸出 Full error)
 
 ### **Session 無法恢復**
 如果 `session.get()` 失敗,會自動建立新 session。
