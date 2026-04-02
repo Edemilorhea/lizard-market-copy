@@ -1,24 +1,173 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
-import { v5 as uuidv5 } from "uuid";
-import type { Client, TextChannel } from "discord.js";
+import { createOpencode, type OpencodeClient } from "@opencode-ai/sdk";
+import type { Client, TextChannel, Message } from "discord.js";
 import type { ActiveSession, ProjectConfig, SessionsState } from "./types";
-import { homedir } from "os";
 import { loadSessions, saveSessions } from "./config";
 import { postApprovalAndWait } from "./approval";
-import { ResponsePoster } from "./response-poster";
 
-const SESSION_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
-
+/**
+ * SessionManager 使用 OpenCode SDK 管理多專案會話
+ * 
+ * 架構變更:
+ * - 共用一個 OpenCode server instance
+ * - 每個專案有獨立的 OpenCode session
+ * - 透過 event.subscribe() 全域事件流接收所有回應
+ * - 根據 session_id 過濾並路由訊息到正確的 Discord 頻道
+ */
 export class SessionManager {
   private sessions = new Map<string, ActiveSession>();
   private savedSessions: SessionsState;
   private idleTimeoutMs: number;
   private saveQueue: Promise<void> = Promise.resolve();
   private discordClient: Client | null = null;
+  
+  // OpenCode SDK client - 全域共用
+  private opencodeClient: OpencodeClient | null = null;
+  private opencodeServer: { url: string; close(): void } | null = null;
+  private eventSubscription: any = null;
+  private eventProcessing = false;
 
   constructor(idleTimeoutMs: number) {
     this.idleTimeoutMs = idleTimeoutMs;
     this.savedSessions = loadSessions();
+  }
+
+  /**
+   * 初始化 OpenCode SDK 並啟動事件監聽
+   */
+  async initialize(): Promise<void> {
+    console.log("[session-manager] Initializing OpenCode SDK...");
+    try {
+      const { client, server } = await createOpencode({
+        hostname: "127.0.0.1",
+        port: 14096,
+        config: {
+          model: "anthropic/claude-sonnet-4-6",
+        },
+      });
+      this.opencodeClient = client;
+      this.opencodeServer = server;
+      console.log(`[session-manager] OpenCode server started at ${server.url}`);
+      
+      // 啟動全域事件監聽
+      await this.startEventListener();
+    } catch (error: any) {
+      console.error("[session-manager] Failed to initialize OpenCode SDK:", error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * 啟動全域事件監聽器
+   * 處理所有 session 的訊息並路由到對應的 Discord 頻道
+   */
+  private async startEventListener(): Promise<void> {
+    if (!this.opencodeClient || this.eventProcessing) return;
+    
+    console.log("[session-manager] Starting global event listener...");
+    this.eventProcessing = true;
+
+    try {
+      const events = await this.opencodeClient.event.subscribe();
+      
+      // 追蹤每個 session 的訊息緩衝
+      const messageBuffers = new Map<string, {
+        text: string;
+        lastSentAt: number;
+        lastMessage: Message | null;
+        channel: TextChannel | null;
+      }>();
+
+      for await (const event of events.stream) {
+        if (!this.eventProcessing) break;
+
+        // 過濾訊息事件
+        if (event.type !== "message") continue;
+        
+        const msgEvent = event as any;
+        const sessionId = msgEvent.session_id;
+        if (!sessionId) continue;
+
+        // 找到對應的專案 session
+        const projectSession = Array.from(this.sessions.values()).find(
+          s => s.sessionId === sessionId
+        );
+        if (!projectSession) continue;
+
+        // 找到對應的 Discord 頻道
+        if (!this.discordClient) continue;
+        let channel: TextChannel;
+        try {
+          channel = await this.discordClient.channels.fetch(
+            projectSession.lastActiveChannel
+          ) as TextChannel;
+        } catch {
+          continue;
+        }
+
+        // 初始化緩衝
+        if (!messageBuffers.has(sessionId)) {
+          messageBuffers.set(sessionId, {
+            text: "",
+            lastSentAt: 0,
+            lastMessage: null,
+            channel,
+          });
+        }
+
+        const buffer = messageBuffers.get(sessionId)!;
+        buffer.channel = channel;
+
+        // 收集 assistant 的文字輸出
+        if (msgEvent.role === "assistant") {
+          for (const part of msgEvent.parts || []) {
+            if (part.type === "text" && part.text) {
+              buffer.text += part.text;
+            }
+          }
+
+          // 定期發送緩衝 (每2秒或達到1500字元)
+          const now = Date.now();
+          if ((now - buffer.lastSentAt >= 2000 && buffer.text.length > 0) || 
+              buffer.text.length >= 1500) {
+            await this.flushBuffer(buffer);
+          }
+        }
+
+        // 訊息完成後,發送剩餘緩衝並清理
+        if (msgEvent.status === "completed" || msgEvent.status === "error") {
+          await this.flushBuffer(buffer);
+          messageBuffers.delete(sessionId);
+        }
+      }
+    } catch (error: any) {
+      console.error("[session-manager] Event listener error:", error.message);
+      this.eventProcessing = false;
+    }
+  }
+
+  /**
+   * 發送緩衝的文字到 Discord
+   */
+  private async flushBuffer(buffer: {
+    text: string;
+    lastSentAt: number;
+    lastMessage: Message | null;
+    channel: TextChannel | null;
+  }): Promise<void> {
+    if (!buffer.channel || buffer.text.length === 0) return;
+
+    try {
+      // Discord 限制 2000 字元,需要分段
+      while (buffer.text.length > 0) {
+        const chunk = buffer.text.slice(0, 2000);
+        buffer.text = buffer.text.slice(2000);
+        
+        buffer.lastMessage = await buffer.channel.send(chunk);
+      }
+      buffer.lastSentAt = Date.now();
+    } catch (error: any) {
+      console.error("[session-manager] Failed to send message:", error.message);
+    }
   }
 
   setDiscordClient(client: Client): void {
@@ -43,59 +192,20 @@ export class SessionManager {
     });
   }
 
-  /**
-   * Build the canUseTool callback for a project session.
-   *
-   * Captures `this` (SessionManager) and `projectName` — NOT a specific channel.
-   * Dynamically looks up lastActiveChannel at invocation time so approval
-   * always goes to the correct channel even if the user switches channels.
-   */
-  private buildCanUseTool(projectName: string) {
-    const manager = this;
-    return async (toolName: string, toolInput: unknown) => {
-      const session = manager.sessions.get(projectName);
-      if (!session || !manager.discordClient) {
-        return { behavior: "deny" as const, message: "No active session or Discord client" };
-      }
-
-      // Auto-approved tools: return undefined to pass through to default behavior
-      // (returning { behavior: "allow" } causes ZodError on updatedInput)
-      if (session.autoApproved.has(toolName)) {
-        return undefined;
-      }
-
-      // Dynamically resolve the CURRENT active channel
-      let channel: TextChannel;
-      try {
-        channel = await manager.discordClient.channels.fetch(
-          session.lastActiveChannel,
-        ) as TextChannel;
-      } catch {
-        return { behavior: "deny" as const, message: "Channel unavailable" };
-      }
-
-      const result = await postApprovalAndWait(channel, toolName, toolInput);
-
-      if (result.autoApprove) {
-        session.autoApproved.add(toolName);
-      }
-
-      if (result.decision === "allow") {
-        return undefined; // pass through — avoids ZodError on updatedInput
-      }
-      return { behavior: "deny" as const, message: "Denied via Discord" };
-    };
-  }
-
   async sendMessage(
     projectName: string,
     project: ProjectConfig,
     text: string,
     channel: TextChannel,
   ): Promise<void> {
+    if (!this.opencodeClient) {
+      await channel.send("❌ OpenCode SDK not initialized");
+      return;
+    }
+
     let session = this.sessions.get(projectName);
 
-    // Update last active channel for existing sessions
+    // Update last active channel
     if (session) {
       session.lastActiveChannel = channel.id;
       session.lastActivityAt = Date.now();
@@ -103,38 +213,54 @@ export class SessionManager {
       this.queueSave();
     }
 
-    const sessionId = uuidv5(projectName, SESSION_NAMESPACE);
-    const resumeId = session?.sessionId
-      ?? this.savedSessions[projectName]?.sessionId;
+    // Get or create OpenCode session
+    let opencodeSessionId: string;
+    const savedSession = this.savedSessions[projectName];
 
-    const poster = new ResponsePoster(channel);
-    const abortController = session?.abortController ?? new AbortController();
-
-    // Build query options
-    // Don't load settingSources — project/user hooks (Kratos, discord-remote)
-    // have PreToolUse handlers that output incorrectly in SDK mode, causing
-    // ZodError on updatedInput. Instead: bypass permissions and let our
-    // canUseTool callback handle all approval via Discord.
-    const options: Record<string, any> = {
-      cwd: project.path,
-      abortController,
-      model: "claude-sonnet-4-6",
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      canUseTool: this.buildCanUseTool(projectName),
-      // Load plugins via local path — SDK only supports type: "local"
-      plugins: [
-        { type: "local", path: homedir() + "/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/linear" },
-        { type: "local", path: homedir() + "/.claude/plugins/cache/lizard-plugins/kratos/2.29.0" },
-        { type: "local", path: homedir() + "/.claude/plugins/cache/claude-plugins-official/frontend-design/b10b583de281" },
-      ],
-    };
-
-    // Resume existing session or start fresh
-    if (resumeId) {
-      options.resume = resumeId;
+    if (session) {
+      opencodeSessionId = session.sessionId;
+    } else if (savedSession) {
+      // 嘗試恢復 session
+      try {
+        await this.opencodeClient.session.get({
+          path: { id: savedSession.sessionId },
+        });
+        opencodeSessionId = savedSession.sessionId;
+        console.log(`[session-manager] Resumed session ${opencodeSessionId} for ${projectName}`);
+      } catch {
+        // Session 不存在,建立新的
+        const result = await this.opencodeClient.session.create({
+          body: {
+            title: `Discord: ${projectName}`,
+            directory: project.path,
+          },
+        });
+        if (!result.data?.id) {
+          await channel.send("❌ Failed to create session");
+          return;
+        }
+        opencodeSessionId = result.data.id;
+        console.log(`[session-manager] Created new session ${opencodeSessionId} for ${projectName}`);
+      }
     } else {
-      options.sessionId = sessionId;
+      // 建立新 session
+      try {
+        const result = await this.opencodeClient.session.create({
+          body: {
+            title: `Discord: ${projectName}`,
+            directory: project.path,
+          },
+        });
+        if (!result.data?.id) {
+          await channel.send("❌ Failed to create session");
+          return;
+        }
+        opencodeSessionId = result.data.id;
+        console.log(`[session-manager] Created new session ${opencodeSessionId} for ${projectName}`);
+      } catch (error: any) {
+        await channel.send(`❌ Session creation failed: ${error.message}`);
+        return;
+      }
     }
 
     // Register session if new
@@ -143,9 +269,11 @@ export class SessionManager {
         () => this.closeSession(projectName),
         this.idleTimeoutMs,
       );
+      const abortController = new AbortController();
+      
       session = {
         projectName,
-        sessionId,
+        sessionId: opencodeSessionId,
         lastActiveChannel: channel.id,
         abortController,
         idleTimer,
@@ -154,46 +282,31 @@ export class SessionManager {
         sendLock: Promise.resolve(),
       };
       this.sessions.set(projectName, session);
-      // Don't queueSave here — wait for init message to capture real session ID
+      this.queueSave();
     }
 
-    // Serialize sends per project — wait for any in-flight query to finish
+    // Serialize sends per project
     const prevLock = session.sendLock;
     let unlock: (() => void) | undefined;
     session.sendLock = new Promise<void>((resolve) => { unlock = resolve; });
     await prevLock;
 
     try {
-      const stream = query({ prompt: text, options });
+      await channel.sendTyping();
 
-      for await (const msg of stream) {
-        // Capture actual session ID from init message
-        if (msg.type === "system" && (msg as any).subtype === "init") {
-          const sid = (msg as any).session_id;
-          if (sid && session) {
-            session.sessionId = sid;
-            this.queueSave();
-          }
-        }
+      // 使用 prompt API 發送訊息
+      // 回應會透過事件監聽器自動處理
+      await this.opencodeClient.session.prompt({
+        path: { id: opencodeSessionId },
+        body: {
+          parts: [{ type: "text", text }],
+        },
+      });
 
-        // Post assistant text to Discord
-        if (msg.type === "assistant" && (msg as any).message?.content) {
-          for (const block of (msg as any).message.content) {
-            if (block.type === "text" && block.text) {
-              await poster.addText(block.text);
-            }
-          }
-        }
-
-        // On result, flush remaining text
-        if (msg.type === "result") {
-          await poster.finish();
-        }
-      }
     } catch (err: any) {
       if (err.name === "AbortError") return;
-      await channel.send(`Session error: ${err.message}`);
-      this.sessions.delete(projectName);
+      await channel.send(`❌ Session error: ${err.message}`);
+      console.error(`[session-manager] Error for project ${projectName}:`, err);
     } finally {
       unlock!();
       this.resetIdleTimer(projectName);
@@ -224,11 +337,22 @@ export class SessionManager {
     };
     this.sessions.delete(projectName);
     this.queueSave();
+    
+    console.log(`[session-manager] Closed session for ${projectName}`);
   }
 
   async closeAll(): Promise<void> {
     const names = [...this.sessions.keys()];
     await Promise.all(names.map((n) => this.closeSession(n)));
+    
+    // 停止事件監聽
+    this.eventProcessing = false;
+    
+    // 關閉 OpenCode server
+    if (this.opencodeServer) {
+      this.opencodeServer.close();
+      console.log("[session-manager] OpenCode server closed");
+    }
   }
 
   getActiveSessions(): Array<{
@@ -249,6 +373,20 @@ export class SessionManager {
   }
 
   async clearSession(projectName: string): Promise<void> {
+    const session = this.sessions.get(projectName);
+    
+    // 刪除 OpenCode session
+    if (session && this.opencodeClient) {
+      try {
+        await this.opencodeClient.session.delete({
+          path: { id: session.sessionId },
+        });
+        console.log(`[session-manager] Deleted session ${session.sessionId}`);
+      } catch (error: any) {
+        console.error(`[session-manager] Failed to delete session:`, error.message);
+      }
+    }
+    
     await this.closeSession(projectName);
     delete this.savedSessions[projectName];
     this.queueSave();

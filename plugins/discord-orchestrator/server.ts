@@ -1,7 +1,6 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { createOpencode, type OpencodeClient } from "@opencode-ai/sdk";
 import { OrchestratorBot } from "./src/bot";
 import { loadBotToken, loadConfig, ensureStateDir, STATE_DIR } from "./src/config";
-import { ResponsePoster } from "./src/response-poster";
 import { watch } from "fs";
 import { join } from "path";
 import type { TextChannel, Message } from "discord.js";
@@ -14,6 +13,13 @@ const bot = new OrchestratorBot();
 const shutdown = async () => {
   console.log("[orchestrator] Shutting down...");
   await bot.shutdown();
+  
+  // 關閉 Ops OpenCode server
+  if (opsServer) {
+    opsServer.close();
+    console.log("[orchestrator] Ops OpenCode server closed");
+  }
+  
   process.exit(0);
 };
 
@@ -36,14 +42,37 @@ watch(join(STATE_DIR, "projects.json"), { persistent: true }, () => {
 // Start API server for ops session to call Discord actions
 const apiPort = await bot.startApiServer();
 
-// Ops channel handler — uses resume for multi-turn conversation continuity
+// Initialize OpenCode SDK for Ops mode
+let opsClient: OpencodeClient | null = null;
+let opsServer: { url: string; close(): void } | null = null;
 let opsSessionId: string | null = null;
 
+console.log("[orchestrator] Initializing OpenCode SDK for Ops mode...");
+try {
+  const { client, server } = await createOpencode({
+    hostname: "127.0.0.1",
+    port: 14097, // 不同的 port,避免與 SessionManager 衝突
+    config: {
+      model: "anthropic/claude-sonnet-4-6",
+    },
+  });
+  opsClient = client;
+  opsServer = server;
+  console.log(`[orchestrator] Ops OpenCode server started at ${server.url}`);
+} catch (error: any) {
+  console.error("[orchestrator] Failed to initialize Ops OpenCode SDK:", error.message);
+  process.exit(1);
+}
+
 bot.onOpsMessage(async (msg: Message) => {
+  if (!opsClient) {
+    const channel = msg.channel as TextChannel;
+    await channel.send("❌ Ops OpenCode SDK not initialized");
+    return;
+  }
+
   const channel = msg.channel as TextChannel;
   await channel.sendTyping();
-
-  const poster = new ResponsePoster(channel);
 
   const opsSystemPrompt = `You are the admin assistant for a Discord orchestrator.
 You manage projects and channel bindings by editing the config file at ${STATE_DIR}/projects.json.
@@ -79,66 +108,77 @@ You can interact with Discord via the orchestrator's API at http://127.0.0.1:${a
 
 After creating a channel, auto-bind it to the project by updating projects.json with the returned channel_id.
 
-- **Clear a project session (fresh start):**
+  - **Clear a project session (fresh start):**
   curl -s -X POST http://127.0.0.1:${apiPort}/clear-session -H "Content-Type: application/json" -d '{"project_name":"PROJECT_NAME"}'
   This aborts any active session and wipes the saved session ID so the next message starts fresh.`;
 
-  const options: Record<string, any> = {
-    cwd: STATE_DIR,
-    systemPrompt: opsSystemPrompt,
-    model: "claude-sonnet-4-6",
-    allowedTools: ["Read", "Write", "Edit", "Bash"],
-    canUseTool: async (toolName: string, toolInput: unknown) => {
-      // Return undefined to allow (avoids ZodError on updatedInput)
-      if (toolName === "Read") return undefined;
-      // Bash: only allow curl to our local API
-      if (toolName === "Bash") {
-        const cmd = String((toolInput as any)?.command ?? "");
-        if (cmd.includes("127.0.0.1") && cmd.includes(String(apiPort))) {
-          return undefined;
-        }
-        return { behavior: "deny" as const, message: "Bash only allowed for curl to local API" };
-      }
-      // Write/Edit must target files within STATE_DIR
-      const input = toolInput as Record<string, any>;
-      const filePath: string = input?.file_path ?? input?.path ?? "";
-      if (filePath.startsWith(STATE_DIR)) {
-        return undefined;
-      }
-      return { behavior: "deny" as const, message: `Ops can only write to ${STATE_DIR}` };
-    },
-  };
-
-  // Resume previous ops conversation if we have a session ID
-  if (opsSessionId) {
-    options.resume = opsSessionId;
-  }
-
   try {
-    const stream = query({ prompt: msg.content, options });
-
-    for await (const m of stream) {
-      // Capture session ID for future resume
-      if (m.type === "system" && (m as any).subtype === "init" && (m as any).session_id) {
-        opsSessionId = (m as any).session_id;
+    // Get or create Ops session
+    if (!opsSessionId) {
+      const result = await opsClient.session.create({
+        body: {
+          title: "Discord Ops Session",
+          directory: STATE_DIR,
+        },
+      });
+      if (!result.data?.id) {
+        await channel.send("❌ Failed to create Ops session");
+        return;
       }
+      opsSessionId = result.data.id;
+      console.log(`[orchestrator] Created Ops session ${opsSessionId}`);
+    }
 
-      if (m.type === "assistant" && (m as any).message?.content) {
-        for (const block of (m as any).message.content) {
-          if (block.type === "text" && block.text) {
-            await poster.addText(block.text);
-          }
+    // 發送系統提示 (只在第一次訊息時)
+    // 注意: OpenCode SDK 可能需要不同的方式設置 system prompt
+    // 這裡先用 noReply 方式注入上下文
+    const messages = await opsClient.session.messages({
+      path: { id: opsSessionId },
+    });
+    
+    if (!messages.data || messages.data.length === 0) {
+      // 第一次訊息,注入 system prompt
+      await opsClient.session.prompt({
+        path: { id: opsSessionId },
+        body: {
+          noReply: true,
+          parts: [{ type: "text", text: opsSystemPrompt }],
+        },
+      });
+    }
+
+    // 發送使用者訊息
+    const result = await opsClient.session.prompt({
+      path: { id: opsSessionId },
+      body: {
+        parts: [{ type: "text", text: msg.content }],
+      },
+    });
+
+    // 發送回應
+    if (result.data?.parts) {
+      let responseText = "";
+      for (const part of result.data.parts) {
+        if (part.type === "text" && part.text) {
+          responseText += part.text;
         }
       }
-      if (m.type === "result") {
-        await poster.finish();
+      
+      // Discord 2000 字元限制,分段發送
+      while (responseText.length > 0) {
+        const chunk = responseText.slice(0, 2000);
+        responseText = responseText.slice(2000);
+        await channel.send(chunk);
       }
     }
+
     // Always rebuild after ops query — fs.watch is unreliable on WSL2
     bot.rebuildChannelMap();
     console.log("[orchestrator] Channel map rebuilt after ops query");
   } catch (err: any) {
-    await channel.send(`Ops error: ${err.message}`);
+    await channel.send(`❌ Ops error: ${err.message}`);
+    console.error("[orchestrator] Ops error:", err);
+    // 清除 session ID,下次重新建立
     opsSessionId = null;
   }
 });

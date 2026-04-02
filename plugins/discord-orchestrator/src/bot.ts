@@ -184,6 +184,8 @@ export class OrchestratorBot {
   }
 
   async start(token: string): Promise<void> {
+    // 初始化 SessionManager 的 OpenCode SDK
+    await this.sessionManager.initialize();
     await this.client.login(token);
   }
 

@@ -1,2 +1,7 @@
-node_modules/
-dist/
+# 測試檔案
+check-*.ts
+test-*.ts
+test.txt
+write-*.ts
+src/*.backup.ts
+src/*.new.ts
