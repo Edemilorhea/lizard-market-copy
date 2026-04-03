@@ -58,13 +58,10 @@ export class OrchestratorBot {
   private async handleMessage(msg: Message): Promise<void> {
     if (msg.author.bot) return;
 
-    console.log(`[orchestrator] Received message in channel ${msg.channel.id} from ${msg.author.tag}`);
-
     const channelId = msg.channel.id;
 
     // Ops channel — delegate to registered handler
     if (channelId === this.config.ops_channel) {
-      console.log('[orchestrator] Message is for Ops channel, delegating to opsHandler');
       if (this.opsHandler) await this.opsHandler(msg);
       return;
     }

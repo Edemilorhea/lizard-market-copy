@@ -1,0 +1,1 @@
+﻿const fs = require("fs"); const c = ; fs.writeFileSync("src/model-manager.ts", c);

@@ -1,0 +1,11 @@
+--- a/src/bot.ts
++++ b/src/bot.ts
+@@ -58,6 +58,8 @@
+   private async handleMessage(msg: Message): Promise<void> {
+     if (msg.author.bot) return;
+ 
++    console.log(`[orchestrator] Received message in channel ${msg.channel.id} from ${msg.author.tag}`);
++
+     const channelId = msg.channel.id;
+ 
+     // Ops channel — delegate to registered handler

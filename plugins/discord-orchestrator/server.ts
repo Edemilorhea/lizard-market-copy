@@ -48,18 +48,32 @@ let opsServer: { url: string; close(): void } | null = null;
 let opsSessionId: string | null = null;
 
 console.log("[orchestrator] Initializing OpenCode SDK for Ops mode...");
+console.log("[orchestrator] STATE_DIR:", STATE_DIR);
 try {
   const { client, server } = await createOpencode({
     hostname: "127.0.0.1",
-    port: 0, // 使用動態 port,避免衝突
+    port: 0,
+    directory: STATE_DIR,
     config: {
       model: "anthropic/claude-sonnet-4-6",
-      password: process.env.OPENCODE_SERVER_PASSWORD || "discord-orchestrator-ops",
     },
   });
   opsClient = client;
   opsServer = server;
   console.log(`[orchestrator] Ops OpenCode server started at ${server.url}`);
+  
+  // 預先建立 session，避免第一次訊息延遲
+  console.log("[orchestrator] Pre-creating Ops session...");
+  const preCreateResult = await client.session.create({
+    title: "Discord Ops Session",
+  });
+  console.log("[orchestrator] Pre-create result:", JSON.stringify(preCreateResult, null, 2));
+  if (preCreateResult.data?.id) {
+    opsSessionId = preCreateResult.data.id;
+    console.log(`[orchestrator] Pre-created Ops session ${opsSessionId}`);
+  } else {
+    console.error("[orchestrator] Failed to pre-create Ops session");
+  }
 } catch (error: any) {
   console.error("[orchestrator] Failed to initialize Ops OpenCode SDK:", error.message);
   console.error("[orchestrator] Full error:", error);
@@ -115,10 +129,15 @@ After creating a channel, auto-bind it to the project by updating projects.json 
   This aborts any active session and wipes the saved session ID so the next message starts fresh.`;
 
   try {
-    // Get or create Ops session
+    // Get or create Ops session (should already exist from pre-creation)
     if (!opsSessionId) {
-      const result = await opsClient.session.create({ title: "Discord Ops Session", directory: STATE_DIR });
+      console.log("[orchestrator] Creating new Ops session (fallback)...");
+      const result = await opsClient.session.create({
+        title: "Discord Ops Session",
+      });
+      console.log("[orchestrator] session.create result:", JSON.stringify(result, null, 2));
       if (!result.data?.id) {
+        console.error("[orchestrator] session.create returned no id");
         await channel.send("❌ Failed to create Ops session");
         return;
       }
@@ -127,17 +146,25 @@ After creating a channel, auto-bind it to the project by updating projects.json 
     }
 
     // 發送系統提示 (只在第一次訊息時)
-    // 注意: OpenCode SDK 可能需要不同的方式設置 system prompt
-    // 這裡先用 noReply 方式注入上下文
-    const messages = await opsClient.session.messages({ sessionID: opsSessionId });
+    const messages = await opsClient.session.messages({
+      sessionID: opsSessionId,
+    });
     
     if (!messages.data || messages.data.length === 0) {
-      // 第一次訊息,注入 system prompt
-      await opsClient.session.prompt({ sessionID: opsSessionId, noReply: true, parts: [{ type: "text", text: opsSystemPrompt }] });
+      console.log("[orchestrator] Injecting system prompt...");
+      await opsClient.session.prompt({
+        sessionID: opsSessionId,
+        noReply: true,
+        parts: [{ type: "text", text: opsSystemPrompt }],
+      });
     }
 
     // 發送使用者訊息
-    const result = await opsClient.session.prompt({ sessionID: opsSessionId, parts: [{ type: "text", text: msg.content }] });
+    console.log("[orchestrator] Sending user prompt:", msg.content);
+    const result = await opsClient.session.prompt({
+      sessionID: opsSessionId,
+      parts: [{ type: "text", text: msg.content }],
+    });
 
     // 發送回應
     if (result.data?.parts) {
@@ -148,21 +175,26 @@ After creating a channel, auto-bind it to the project by updating projects.json 
         }
       }
       
-      // Discord 2000 字元限制,分段發送
-      while (responseText.length > 0) {
-        const chunk = responseText.slice(0, 2000);
-        responseText = responseText.slice(2000);
-        await channel.send(chunk);
+      if (responseText.length === 0) {
+        await channel.send("⚠️ No text response from assistant");
+      } else {
+        // Discord 2000 字元限制,分段發送
+        while (responseText.length > 0) {
+          const chunk = responseText.slice(0, 2000);
+          responseText = responseText.slice(2000);
+          await channel.send(chunk);
+        }
       }
+    } else {
+      await channel.send("⚠️ No response parts from assistant");
     }
 
-    // Always rebuild after ops query — fs.watch is unreliable on WSL2
+    // Always rebuild after ops query
     bot.rebuildChannelMap();
     console.log("[orchestrator] Channel map rebuilt after ops query");
   } catch (err: any) {
     await channel.send(`❌ Ops error: ${err.message}`);
     console.error("[orchestrator] Ops error:", err);
-    // 清除 session ID,下次重新建立
     opsSessionId = null;
   }
 });

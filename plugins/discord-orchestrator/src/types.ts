@@ -2,11 +2,13 @@ export interface ProjectConfig {
   name: string;
   path: string;
   channels: string[];
+  model?: string; // Optional: 專案使用的模型
 }
 
 export interface OrchestratorConfig {
   projects: Record<string, ProjectConfig>;
   ops_channel: string;
+  ops_model?: string; // Optional: Ops 使用的模型
   idle_timeout_ms: number;
 }
 
