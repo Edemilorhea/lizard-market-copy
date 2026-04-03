@@ -49,7 +49,7 @@ export class SessionManager {
 
       for await (const event of events.stream) {
         if (!this.eventProcessing) break;
-        const sessionId = (event as any).properties?.sessionID;
+        const sessionId = (event as any).properties?.sessionID || (event as any).properties?.info?.sessionID;
         const projectSession = sessionId ? Array.from(this.sessions.values()).find(s => s.sessionId === sessionId) : null;
         if (sessionId && !projectSession) continue;
 
@@ -87,7 +87,12 @@ console.log(`[session-manager] Status value: ${status}`);
               if (projectSession.autoApproved.has(props.permission)) {
                 await this.opencodeClient!.permission.reply({ requestID: props.id, reply: 'once' });
               } else {
-                const result = await postApprovalAndWait(channel, props.permission || 'Unknown', props.metadata || {}, 60_000);
+                const permissionInfo = {
+                permission: props.permission || 'Unknown',
+                patterns: props.patterns,
+                metadata: props.metadata,
+              };
+              const result = await postApprovalAndWait(channel, props.permission || 'Unknown', permissionInfo, 60_000);
                 console.log(`[session-manager] Permission result:`, result);
                 const reply = result.decision === 'allow' ? (result.autoApprove ? 'always' : 'once') : 'reject';
                 console.log(`[session-manager] Sending permission reply: ${reply} for ${props.id}`);
@@ -117,8 +122,9 @@ console.log(`[session-manager] Status value: ${status}`);
               }
               const buffer = messageBuffers.get(sessionId)!;
               buffer.text += deltaText;
-              const now = Date.now();
-              if ((now - buffer.lastSentAt >= 2000 && buffer.text.length > 0) || buffer.text.length >= 1500) {
+              // Only flush if buffer is getting close to Discord's 2000 char limit
+              // Otherwise wait for message.updated to flush complete message
+              if (buffer.text.length >= 1800) {
                 await this.flushBuffer(buffer);
               }
             }
@@ -126,11 +132,30 @@ console.log(`[session-manager] Status value: ${status}`);
           }
 
           case 'message.updated': {
-            if (!projectSession) break;
             const props = (event as any).properties;
-            if (props?.info?.role === 'assistant' || props?.message?.role === 'assistant') {
+            const info = props?.info || props?.message;
+            const isAssistant = info?.role === 'assistant';
+            const isCompleted = info?.time?.completed != null;
+            
+            console.log('[session-manager] message.updated DEBUG:', { 
+              hasProjectSession: !!projectSession, 
+              sessionId, 
+              isAssistant, 
+              isCompleted,
+              bufferExists: messageBuffers.has(sessionId),
+              bufferSize: messageBuffers.get(sessionId)?.text?.length ?? 0
+            });
+            
+            if (!projectSession) break;
+            
+            // Only flush when the assistant message is fully completed (has completed timestamp)
+            if (isAssistant && isCompleted) {
               const buffer = messageBuffers.get(sessionId);
-              if (buffer && buffer.text.length > 0) await this.flushBuffer(buffer);
+              console.log('[session-manager] FLUSHING! Buffer size:', buffer?.text?.length ?? 0);
+              if (buffer && buffer.text.length > 0) {
+                await this.flushBuffer(buffer);
+                console.log('[session-manager] Buffer flushed successfully');
+              }
               messageBuffers.delete(sessionId);
             }
             break;

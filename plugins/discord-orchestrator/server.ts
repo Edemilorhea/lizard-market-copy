@@ -122,10 +122,15 @@ async function startOpsEventListener(): Promise<void> {
               console.log(`[orchestrator] Auto-approving ${props.permission}`);
               await opsClient.permission.reply({ requestID: props.id, reply: "once" });
             } else {
+              const permissionInfo = {
+                permission: props.permission || "Unknown",
+                patterns: props.patterns,
+                metadata: props.metadata,
+              };
               const result = await postApprovalAndWait(
                 opsChannel,
                 props.permission || "Unknown",
-                props.metadata || {},
+                permissionInfo,
                 60_000
               );
               const reply = result.decision === "allow" 
@@ -155,9 +160,8 @@ async function startOpsEventListener(): Promise<void> {
               opsMessageBuffer = { text: "", lastSentAt: 0, lastMessage: null };
             }
             opsMessageBuffer.text += deltaText;
-            const now = Date.now();
-            if ((now - opsMessageBuffer.lastSentAt >= 2000 && opsMessageBuffer.text.length > 0) || 
-                opsMessageBuffer.text.length >= 1500) {
+            // Only flush if buffer is getting close to Discord's 2000 char limit
+            if (opsMessageBuffer.text.length >= 1800) {
               await flushOpsBuffer();
             }
           }
