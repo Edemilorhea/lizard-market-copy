@@ -1,4 +1,4 @@
-import { createOpencode, type OpencodeClient } from "@opencode-ai/sdk";
+import { createOpencode, type OpencodeClient } from "@opencode-ai/sdk/v2";
 import { OrchestratorBot } from "./src/bot";
 import { loadBotToken, loadConfig, ensureStateDir, STATE_DIR } from "./src/config";
 import { watch } from "fs";
@@ -117,12 +117,7 @@ After creating a channel, auto-bind it to the project by updating projects.json 
   try {
     // Get or create Ops session
     if (!opsSessionId) {
-      const result = await opsClient.session.create({
-        body: {
-          title: "Discord Ops Session",
-          directory: STATE_DIR,
-        },
-      });
+      const result = await opsClient.session.create({ title: "Discord Ops Session", directory: STATE_DIR });
       if (!result.data?.id) {
         await channel.send("❌ Failed to create Ops session");
         return;
@@ -134,28 +129,15 @@ After creating a channel, auto-bind it to the project by updating projects.json 
     // 發送系統提示 (只在第一次訊息時)
     // 注意: OpenCode SDK 可能需要不同的方式設置 system prompt
     // 這裡先用 noReply 方式注入上下文
-    const messages = await opsClient.session.messages({
-      path: { id: opsSessionId },
-    });
+    const messages = await opsClient.session.messages({ sessionID: opsSessionId });
     
     if (!messages.data || messages.data.length === 0) {
       // 第一次訊息,注入 system prompt
-      await opsClient.session.prompt({
-        path: { id: opsSessionId },
-        body: {
-          noReply: true,
-          parts: [{ type: "text", text: opsSystemPrompt }],
-        },
-      });
+      await opsClient.session.prompt({ sessionID: opsSessionId, noReply: true, parts: [{ type: "text", text: opsSystemPrompt }] });
     }
 
     // 發送使用者訊息
-    const result = await opsClient.session.prompt({
-      path: { id: opsSessionId },
-      body: {
-        parts: [{ type: "text", text: msg.content }],
-      },
-    });
+    const result = await opsClient.session.prompt({ sessionID: opsSessionId, parts: [{ type: "text", text: msg.content }] });
 
     // 發送回應
     if (result.data?.parts) {
