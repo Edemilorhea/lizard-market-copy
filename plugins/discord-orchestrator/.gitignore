@@ -5,3 +5,5 @@ test.txt
 write-*.ts
 src/*.backup.ts
 src/*.new.ts
+node_modules/
+dist/
