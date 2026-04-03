@@ -3,6 +3,7 @@ export interface ProjectConfig {
   path: string;
   channels: string[];
   model?: string; // Optional: 專案使用的模型
+  agent?: string; // Optional: 專案使用的 Agent (OpenAgent, OpenCoder)
 }
 
 export interface OrchestratorConfig {

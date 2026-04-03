@@ -263,7 +263,26 @@ console.log(`[session-manager] Status value: ${status}`);
     await prevLock;
 
     try {
-      await this.opencodeClient.session.promptAsync({ sessionID: opencodeSessionId, parts: [{ type: 'text', text }] });
+      // Build prompt options with model and agent if configured
+      const promptOptions: any = {
+        sessionID: opencodeSessionId,
+        parts: [{ type: 'text', text }],
+      };
+      
+      // Add model if configured
+      if (project.model) {
+        const [providerID, modelID] = project.model.split('/');
+        if (providerID && modelID) {
+          promptOptions.model = { providerID, modelID };
+        }
+      }
+      
+      // Add agent if configured
+      if (project.agent) {
+        promptOptions.agent = project.agent;
+      }
+      
+      await this.opencodeClient.session.promptAsync(promptOptions);
     } catch (err: any) {
       if (err.name === 'AbortError') return;
       await channel.send(`❌ Session error: ${err.message}`);
