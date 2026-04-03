@@ -1,6 +1,7 @@
 import { createOpencode, type OpencodeClient } from "@opencode-ai/sdk/v2";
 import { OrchestratorBot } from "./src/bot";
 import { loadBotToken, loadConfig, ensureStateDir, STATE_DIR } from "./src/config";
+import { postApprovalAndWait } from "./src/approval";
 import { watch } from "fs";
 import { join } from "path";
 import type { TextChannel, Message } from "discord.js";
@@ -12,6 +13,7 @@ const bot = new OrchestratorBot();
 // Graceful shutdown
 const shutdown = async () => {
   console.log("[orchestrator] Shutting down...");
+  opsEventProcessing = false;
   await bot.shutdown();
   
   // 關閉 Ops OpenCode server
@@ -46,6 +48,155 @@ const apiPort = await bot.startApiServer();
 let opsClient: OpencodeClient | null = null;
 let opsServer: { url: string; close(): void } | null = null;
 let opsSessionId: string | null = null;
+let opsChannel: TextChannel | null = null;
+let opsThinkingMessage: Message | null = null;
+let opsAutoApproved = new Set<string>();
+let opsEventProcessing = false;
+
+// Message buffer for streaming responses
+interface MessageBuffer {
+  text: string;
+  lastSentAt: number;
+  lastMessage: Message | null;
+}
+let opsMessageBuffer: MessageBuffer | null = null;
+
+async function flushOpsBuffer(): Promise<void> {
+  if (!opsMessageBuffer || !opsChannel || opsMessageBuffer.text.length === 0) return;
+  try {
+    while (opsMessageBuffer.text.length > 0) {
+      const chunk = opsMessageBuffer.text.slice(0, 2000);
+      opsMessageBuffer.text = opsMessageBuffer.text.slice(2000);
+      opsMessageBuffer.lastMessage = await opsChannel.send(chunk);
+    }
+    opsMessageBuffer.lastSentAt = Date.now();
+  } catch (e: any) {
+    console.error("[orchestrator] Failed to send message:", e.message);
+  }
+}
+
+async function startOpsEventListener(): Promise<void> {
+  if (!opsClient || opsEventProcessing) return;
+  console.log("[orchestrator] Starting Ops event listener...");
+  opsEventProcessing = true;
+
+  try {
+    const events = await opsClient.event.subscribe();
+
+    for await (const event of events.stream) {
+      if (!opsEventProcessing) break;
+      
+      const sessionId = (event as any).properties?.sessionID;
+      if (sessionId && sessionId !== opsSessionId) continue;
+
+      console.log(`[orchestrator] Ops Event: ${event.type}`, JSON.stringify((event as any).properties || {}));
+
+      switch (event.type) {
+        case "session.status": {
+          if (!opsChannel) break;
+          const statusObj = (event as any).properties?.status;
+          const status = typeof statusObj === 'string' ? statusObj : statusObj?.type;
+          try {
+            if (status === "busy" && !opsThinkingMessage) {
+              opsThinkingMessage = await opsChannel.send("🤔 **Ops** 思考中...");
+              await opsChannel.sendTyping();
+            } else if (status === "idle" && opsThinkingMessage) {
+              try { await opsThinkingMessage.delete(); } catch {}
+              opsThinkingMessage = null;
+            }
+          } catch (e: any) {
+            console.error("[orchestrator] status error:", e.message);
+          }
+          break;
+        }
+
+        case "permission.asked": {
+          if (!opsChannel || !opsClient) break;
+          const props = (event as any).properties;
+          try {
+            if (opsThinkingMessage) {
+              try { await opsThinkingMessage.edit("🔐 **Ops** 等待權限確認..."); } catch {}
+            }
+
+            if (opsAutoApproved.has(props.permission)) {
+              console.log(`[orchestrator] Auto-approving ${props.permission}`);
+              await opsClient.permission.reply({ requestID: props.id, reply: "once" });
+            } else {
+              const result = await postApprovalAndWait(
+                opsChannel,
+                props.permission || "Unknown",
+                props.metadata || {},
+                60_000
+              );
+              const reply = result.decision === "allow" 
+                ? (result.autoApprove ? "always" : "once") 
+                : "reject";
+              await opsClient.permission.reply({ requestID: props.id, reply });
+              if (result.autoApprove) opsAutoApproved.add(props.permission);
+            }
+
+            if (opsThinkingMessage) {
+              try { await opsThinkingMessage.edit("🤔 **Ops** 思考中..."); } catch {}
+            }
+          } catch (e: any) {
+            console.error("[orchestrator] permission error:", e.message);
+          }
+          break;
+        }
+
+        case "message.part.delta": {
+          if (!opsChannel) break;
+          const props = (event as any).properties;
+          const deltaText = props?.delta || (props?.part?.type === "text" ? props?.part?.text : null);
+          const isTextDelta = props?.field === "text" || props?.part?.type === "text";
+          if (isTextDelta && deltaText) {
+            console.log(`[orchestrator] Ops delta text: ${deltaText.slice(0, 50)}...`);
+            if (!opsMessageBuffer) {
+              opsMessageBuffer = { text: "", lastSentAt: 0, lastMessage: null };
+            }
+            opsMessageBuffer.text += deltaText;
+            const now = Date.now();
+            if ((now - opsMessageBuffer.lastSentAt >= 2000 && opsMessageBuffer.text.length > 0) || 
+                opsMessageBuffer.text.length >= 1500) {
+              await flushOpsBuffer();
+            }
+          }
+          break;
+        }
+
+        case "message.updated": {
+          const props = (event as any).properties;
+          if (props?.message?.role === "assistant") {
+            if (opsMessageBuffer && opsMessageBuffer.text.length > 0) {
+              await flushOpsBuffer();
+            }
+            opsMessageBuffer = null;
+            bot.rebuildChannelMap();
+            console.log("[orchestrator] Channel map rebuilt after ops response");
+          }
+          break;
+        }
+
+        case "session.error": {
+          if (!opsChannel) break;
+          const props = (event as any).properties;
+          try {
+            await opsChannel.send(`❌ Session error: ${props?.error || "Unknown error"}`);
+          } catch {}
+          if (opsThinkingMessage) {
+            try { await opsThinkingMessage.delete(); } catch {}
+            opsThinkingMessage = null;
+          }
+          opsMessageBuffer = null;
+          break;
+        }
+      }
+    }
+  } catch (error: any) {
+    console.error("[orchestrator] Event listener error:", error.message);
+    opsEventProcessing = false;
+  }
+}
 
 console.log("[orchestrator] Initializing OpenCode SDK for Ops mode...");
 console.log("[orchestrator] STATE_DIR:", STATE_DIR);
@@ -53,7 +204,6 @@ try {
   const { client, server } = await createOpencode({
     hostname: "127.0.0.1",
     port: 0,
-    directory: STATE_DIR,
     config: {
       model: "anthropic/claude-sonnet-4-6",
     },
@@ -65,12 +215,15 @@ try {
   // 預先建立 session，避免第一次訊息延遲
   console.log("[orchestrator] Pre-creating Ops session...");
   const preCreateResult = await client.session.create({
+    directory: STATE_DIR,
     title: "Discord Ops Session",
   });
   console.log("[orchestrator] Pre-create result:", JSON.stringify(preCreateResult, null, 2));
   if (preCreateResult.data?.id) {
     opsSessionId = preCreateResult.data.id;
     console.log(`[orchestrator] Pre-created Ops session ${opsSessionId}`);
+    // Start event listener
+    startOpsEventListener();
   } else {
     console.error("[orchestrator] Failed to pre-create Ops session");
   }
@@ -82,13 +235,13 @@ try {
 
 bot.onOpsMessage(async (msg: Message) => {
   if (!opsClient) {
-    const channel = msg.channel as TextChannel;
-    await channel.send("❌ Ops OpenCode SDK not initialized");
+    opsChannel = msg.channel as TextChannel;
+    await opsChannel.send("❌ Ops OpenCode SDK not initialized");
     return;
   }
 
-  const channel = msg.channel as TextChannel;
-  await channel.sendTyping();
+  opsChannel = msg.channel as TextChannel;
+  await opsChannel.sendTyping();
 
   const opsSystemPrompt = `You are the admin assistant for a Discord orchestrator.
 You manage projects and channel bindings by editing the config file at ${STATE_DIR}/projects.json.
@@ -133,16 +286,19 @@ After creating a channel, auto-bind it to the project by updating projects.json 
     if (!opsSessionId) {
       console.log("[orchestrator] Creating new Ops session (fallback)...");
       const result = await opsClient.session.create({
+        directory: STATE_DIR,
         title: "Discord Ops Session",
       });
       console.log("[orchestrator] session.create result:", JSON.stringify(result, null, 2));
       if (!result.data?.id) {
         console.error("[orchestrator] session.create returned no id");
-        await channel.send("❌ Failed to create Ops session");
+        await opsChannel.send("❌ Failed to create Ops session");
         return;
       }
       opsSessionId = result.data.id;
       console.log(`[orchestrator] Created Ops session ${opsSessionId}`);
+      // Start event listener for fallback session
+      startOpsEventListener();
     }
 
     // 發送系統提示 (只在第一次訊息時)
@@ -159,41 +315,14 @@ After creating a channel, auto-bind it to the project by updating projects.json 
       });
     }
 
-    // 發送使用者訊息
+    // 發送使用者訊息 (async - response handled by events)
     console.log("[orchestrator] Sending user prompt:", msg.content);
-    const result = await opsClient.session.prompt({
+    await opsClient.session.promptAsync({
       sessionID: opsSessionId,
       parts: [{ type: "text", text: msg.content }],
     });
-
-    // 發送回應
-    if (result.data?.parts) {
-      let responseText = "";
-      for (const part of result.data.parts) {
-        if (part.type === "text" && part.text) {
-          responseText += part.text;
-        }
-      }
-      
-      if (responseText.length === 0) {
-        await channel.send("⚠️ No text response from assistant");
-      } else {
-        // Discord 2000 字元限制,分段發送
-        while (responseText.length > 0) {
-          const chunk = responseText.slice(0, 2000);
-          responseText = responseText.slice(2000);
-          await channel.send(chunk);
-        }
-      }
-    } else {
-      await channel.send("⚠️ No response parts from assistant");
-    }
-
-    // Always rebuild after ops query
-    bot.rebuildChannelMap();
-    console.log("[orchestrator] Channel map rebuilt after ops query");
   } catch (err: any) {
-    await channel.send(`❌ Ops error: ${err.message}`);
+    await opsChannel.send(`❌ Ops error: ${err.message}`);
     console.error("[orchestrator] Ops error:", err);
     opsSessionId = null;
   }

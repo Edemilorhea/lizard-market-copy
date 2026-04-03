@@ -78,6 +78,18 @@ export class OrchestratorBot {
 
     const channel = msg.channel as TextChannel;
 
+    // Handle !stop command to cancel current session
+    if (msg.content.trim().toLowerCase() === '!stop' || msg.content.trim().toLowerCase() === '!cancel') {
+      console.log(`[orchestrator] Stop command received for ${projectName}`);
+      try {
+        await this.sessionManager.abortSession(projectName);
+        await channel.send(`⏹️ Session for **${projectName}** has been stopped.`);
+      } catch (e: any) {
+        await channel.send(`❌ Failed to stop session: ${e.message}`);
+      }
+      return;
+    }
+
     // Instant acknowledgement so the user knows the bot received the message
     const isNewSession = !this.sessionManager.hasSession(projectName);
     const ack = isNewSession
