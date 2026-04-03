@@ -170,7 +170,10 @@ async function startOpsEventListener(): Promise<void> {
 
         case "message.updated": {
           const props = (event as any).properties;
-          if (props?.message?.role === "assistant") {
+          // Check both props.info.role (new format) and props.message.role (old format)
+          const role = props?.info?.role || props?.message?.role;
+          const isCompleted = props?.info?.time?.completed || props?.message?.time?.completed;
+          if (role === "assistant" && isCompleted) {
             if (opsMessageBuffer && opsMessageBuffer.text.length > 0) {
               await flushOpsBuffer();
             }
@@ -321,10 +324,21 @@ After creating a channel, auto-bind it to the project by updating projects.json 
 
     // 發送使用者訊息 (async - response handled by events)
     console.log("[orchestrator] Sending user prompt:", msg.content);
-    await opsClient.session.promptAsync({
+    const currentConfig = loadConfig();
+    const promptOptions: any = {
       sessionID: opsSessionId,
       parts: [{ type: "text", text: msg.content }],
-    });
+    };
+    
+    // Add model if configured
+    if (currentConfig.ops_model) {
+      const [providerID, modelID] = currentConfig.ops_model.split('/');
+      if (providerID && modelID) {
+        promptOptions.model = { providerID, modelID };
+      }
+    }
+    
+    await opsClient.session.promptAsync(promptOptions);
   } catch (err: any) {
     await opsChannel.send(`❌ Ops error: ${err.message}`);
     console.error("[orchestrator] Ops error:", err);
