@@ -1,9 +1,94 @@
-import { createOpencode, type OpencodeClient } from '@opencode-ai/sdk/v2';
+import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk/v2';
+import { spawn, type ChildProcess } from 'child_process';
 import type { Client, TextChannel, Message } from 'discord.js';
 import type { ActiveSession, ProjectConfig, SessionsState } from './types';
 import { loadSessions, saveSessions } from './config';
 import { postApprovalAndWait } from './approval';
 import type { SessionStatusInfo } from './status-commands';
+
+interface ProjectServer {
+  url: string;
+  client: OpencodeClient;
+  process: ChildProcess;
+  close(): void;
+}
+
+/**
+ * Create an OpenCode server with a specific working directory (cwd).
+ * This spawns `opencode serve` as a child process with the cwd set to projectPath.
+ */
+async function createOpencodeServerWithCwd(options: {
+  hostname: string;
+  port: number;
+  projectPath: string;
+}): Promise<{ url: string; close(): void; process: ChildProcess }> {
+  const { hostname, port, projectPath } = options;
+  
+  return new Promise((resolve, reject) => {
+    const child = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
+      cwd: projectPath,
+      shell: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdoutBuffer = '';
+    let resolved = false;
+    const urlRegex = /on\s+(https?:\/\/[^\s]+)/;
+
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        child.kill();
+        reject(new Error(`Timeout waiting for opencode server to start in ${projectPath}`));
+      }
+    }, 30000);
+
+    child.stdout?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      stdoutBuffer += text;
+      console.log(`[opencode-server:${projectPath}] stdout: ${text.trim()}`);
+
+      const lines = stdoutBuffer.split('\n');
+      for (const line of lines) {
+        const match = line.match(urlRegex);
+        if (match && !resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          const url = match[1];
+          resolve({
+            url,
+            process: child,
+            close: () => {
+              child.kill();
+            },
+          });
+          break;
+        }
+      }
+    });
+
+    child.stderr?.on('data', (data: Buffer) => {
+      const text = data.toString();
+      console.error(`[opencode-server:${projectPath}] stderr: ${text.trim()}`);
+    });
+
+    child.on('error', (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        reject(err);
+      }
+    });
+
+    child.on('exit', (code) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        reject(new Error(`opencode serve exited with code ${code} before starting`));
+      }
+    });
+  });
+}
 
 export class SessionManager {
   private sessions = new Map<string, ActiveSession>();
@@ -11,9 +96,7 @@ export class SessionManager {
   private idleTimeoutMs: number;
   private saveQueue: Promise<void> = Promise.resolve();
   private discordClient: Client | null = null;
-  private opencodeClient: OpencodeClient | null = null;
-  private opencodeServer: { url: string; close(): void } | null = null;
-  private eventProcessing = false;
+  private projectServers = new Map<string, ProjectServer>();
   private thinkingMessages = new Map<string, Message>();
 
   constructor(idleTimeoutMs: number) {
@@ -22,164 +105,205 @@ export class SessionManager {
   }
 
   async initialize(): Promise<void> {
-    console.log('[session-manager] Initializing OpenCode SDK...');
+    console.log('[session-manager] SessionManager initialized (per-project servers mode)');
+    // In per-project mode, servers are created lazily when needed
+  }
+
+  private async getOrCreateProjectServer(projectName: string, projectPath: string): Promise<ProjectServer> {
+    const existing = this.projectServers.get(projectName);
+    if (existing) {
+      return existing;
+    }
+
+    console.log(`[session-manager] Creating OpenCode server for project "${projectName}" at ${projectPath}`);
+
     try {
-      const { client, server } = await createOpencode({
+      const server = await createOpencodeServerWithCwd({
         hostname: '127.0.0.1',
-        port: 0,
-        config: { model: 'anthropic/claude-sonnet-4-6' },
+        port: 0, // Random available port
+        projectPath,
       });
-      this.opencodeClient = client;
-      this.opencodeServer = server;
-      console.log(`[session-manager] OpenCode server started at ${server.url}`);
-      this.startEventListener();
+
+      console.log(`[session-manager] OpenCode server started for "${projectName}" at ${server.url}`);
+
+      const client = createOpencodeClient({ baseUrl: server.url });
+
+      const projectServer: ProjectServer = {
+        url: server.url,
+        client,
+        process: server.process,
+        close: () => {
+          server.close();
+          this.projectServers.delete(projectName);
+        },
+      };
+
+      this.projectServers.set(projectName, projectServer);
+
+      // Start event listener for this project
+      this.startEventListenerForProject(projectName, projectServer);
+
+      return projectServer;
     } catch (error: any) {
-      console.error('[session-manager] Failed to initialize OpenCode SDK:', error.message);
+      console.error(`[session-manager] Failed to create server for "${projectName}":`, error.message);
       throw error;
     }
   }
 
-  private async startEventListener(): Promise<void> {
-    if (!this.opencodeClient || this.eventProcessing) return;
-    console.log('[session-manager] Starting global event listener...');
-    this.eventProcessing = true;
+  private async startEventListenerForProject(projectName: string, ps: ProjectServer): Promise<void> {
+    console.log(`[session-manager] Starting event listener for project "${projectName}"...`);
+
+    const messageBuffers = new Map<string, { text: string; lastSentAt: number; lastMessage: Message | null; channel: TextChannel | null; }>();
 
     try {
-      const events = await this.opencodeClient.event.subscribe();
-      const messageBuffers = new Map<string, { text: string; lastSentAt: number; lastMessage: Message | null; channel: TextChannel | null; }>();
+      const events = await ps.client.event.subscribe();
 
-      for await (const event of events.stream) {
-        if (!this.eventProcessing) break;
-        const sessionId = (event as any).properties?.sessionID || (event as any).properties?.info?.sessionID;
-        const projectSession = sessionId ? Array.from(this.sessions.values()).find(s => s.sessionId === sessionId) : null;
-        if (sessionId && !projectSession) continue;
+      (async () => {
+        try {
+          for await (const event of events.stream) {
+            // Check if project server still exists
+            if (!this.projectServers.has(projectName)) {
+              console.log(`[session-manager] Project "${projectName}" server closed, stopping event listener`);
+              break;
+            }
 
-        console.log(`[session-manager] Event: ${event.type}${projectSession ? ` for ${projectSession.projectName}` : ''}`, JSON.stringify((event as any).properties || {}).slice(0, 200));
+            const sessionId = (event as any).properties?.sessionID || (event as any).properties?.info?.sessionID;
+            const projectSession = sessionId ? this.sessions.get(projectName) : null;
 
-        switch (event.type) {
-          case 'session.status': {
-            if (!projectSession || !this.discordClient) break;
-            const statusObj = (event as any).properties?.status;
-const status = typeof statusObj === 'string' ? statusObj : statusObj?.type;
-console.log(`[session-manager] Status value: ${status}`);
-            try {
-              const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
-              if (status === 'busy' && !this.thinkingMessages.has(sessionId)) {
-                const msg = await channel.send(`🤔 **${projectSession.projectName}** 思考中...`);
-                this.thinkingMessages.set(sessionId, msg);
-                await channel.sendTyping();
-              } else if (status === 'idle' && this.thinkingMessages.has(sessionId)) {
+            // Only process events for sessions we're tracking
+            if (sessionId && projectSession && projectSession.sessionId !== sessionId) {
+              continue;
+            }
+
+            console.log(`[session-manager] [${projectName}] Event: ${event.type}`, JSON.stringify((event as any).properties || {}).slice(0, 200));
+
+            switch (event.type) {
+              case 'session.status': {
+                if (!projectSession || !this.discordClient) break;
+                const statusObj = (event as any).properties?.status;
+                const status = typeof statusObj === 'string' ? statusObj : statusObj?.type;
+                console.log(`[session-manager] [${projectName}] Status value: ${status}`);
+                try {
+                  const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
+                  if (status === 'busy' && !this.thinkingMessages.has(sessionId)) {
+                    const msg = await channel.send(`🤔 **${projectSession.projectName}** 思考中...`);
+                    this.thinkingMessages.set(sessionId, msg);
+                    await channel.sendTyping();
+                  } else if (status === 'idle' && this.thinkingMessages.has(sessionId)) {
+                    const msg = this.thinkingMessages.get(sessionId);
+                    if (msg) try { await msg.delete(); } catch {}
+                    this.thinkingMessages.delete(sessionId);
+                  }
+                } catch (e: any) { console.error(`[session-manager] [${projectName}] status error:`, e.message); }
+                break;
+              }
+
+              case 'permission.asked': {
+                if (!projectSession || !this.discordClient) break;
+                const props = (event as any).properties;
+                try {
+                  const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
+                  const thinkingMsg = this.thinkingMessages.get(sessionId);
+                  if (thinkingMsg) try { await thinkingMsg.edit(`🔐 **${projectSession.projectName}** 等待權限確認...`); } catch {}
+
+                  if (projectSession.autoApproved.has(props.permission)) {
+                    await ps.client.permission.reply({ requestID: props.id, reply: 'once' });
+                  } else {
+                    const permissionInfo = {
+                      permission: props.permission || 'Unknown',
+                      patterns: props.patterns,
+                      metadata: props.metadata,
+                    };
+                    const result = await postApprovalAndWait(channel, props.permission || 'Unknown', permissionInfo, 60_000);
+                    console.log(`[session-manager] [${projectName}] Permission result:`, result);
+                    const reply = result.decision === 'allow' ? (result.autoApprove ? 'always' : 'once') : 'reject';
+                    console.log(`[session-manager] [${projectName}] Sending permission reply: ${reply} for ${props.id}`);
+                    await ps.client.permission.reply({ requestID: props.id, reply });
+                    console.log(`[session-manager] [${projectName}] Permission reply sent successfully`);
+                    if (result.autoApprove) projectSession.autoApproved.add(props.permission);
+                  }
+
+                  if (thinkingMsg) try { await thinkingMsg.edit(`🤔 **${projectSession.projectName}** 思考中...`); } catch {}
+                } catch (e: any) { console.error(`[session-manager] [${projectName}] permission error:`, e.message); }
+                break;
+              }
+
+              case 'message.part.delta': {
+                if (!projectSession || !this.discordClient) break;
+                const props = (event as any).properties;
+                // Support both old format (props.part.text) and new format (props.delta with props.field === 'text')
+                const deltaText = props?.delta || (props?.part?.type === 'text' ? props?.part?.text : null);
+                const isTextDelta = props?.field === 'text' || props?.part?.type === 'text';
+                if (isTextDelta && deltaText) {
+                  console.log(`[session-manager] [${projectName}] Delta text received: ${deltaText.slice(0, 50)}...`);
+                  if (!messageBuffers.has(sessionId)) {
+                    try {
+                      const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
+                      messageBuffers.set(sessionId, { text: '', lastSentAt: 0, lastMessage: null, channel });
+                    } catch { break; }
+                  }
+                  const buffer = messageBuffers.get(sessionId)!;
+                  buffer.text += deltaText;
+                  // Only flush if buffer is getting close to Discord's 2000 char limit
+                  // Otherwise wait for message.updated to flush complete message
+                  if (buffer.text.length >= 1800) {
+                    await this.flushBuffer(buffer);
+                  }
+                }
+                break;
+              }
+
+              case 'message.updated': {
+                const props = (event as any).properties;
+                const info = props?.info || props?.message;
+                const isAssistant = info?.role === 'assistant';
+                const isCompleted = info?.time?.completed != null;
+
+                console.log(`[session-manager] [${projectName}] message.updated DEBUG:`, {
+                  hasProjectSession: !!projectSession,
+                  sessionId,
+                  isAssistant,
+                  isCompleted,
+                  bufferExists: messageBuffers.has(sessionId),
+                  bufferSize: messageBuffers.get(sessionId)?.text?.length ?? 0
+                });
+
+                if (!projectSession) break;
+
+                // Only flush when the assistant message is fully completed (has completed timestamp)
+                if (isAssistant && isCompleted) {
+                  const buffer = messageBuffers.get(sessionId);
+                  console.log(`[session-manager] [${projectName}] FLUSHING! Buffer size:`, buffer?.text?.length ?? 0);
+                  if (buffer && buffer.text.length > 0) {
+                    await this.flushBuffer(buffer);
+                    console.log(`[session-manager] [${projectName}] Buffer flushed successfully`);
+                  }
+                  messageBuffers.delete(sessionId);
+                }
+                break;
+              }
+
+              case 'session.error': {
+                if (!projectSession || !this.discordClient) break;
+                const props = (event as any).properties;
+                try {
+                  const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
+                  await channel.send(`❌ Session error: ${props?.error || 'Unknown error'}`);
+                } catch {}
                 const msg = this.thinkingMessages.get(sessionId);
                 if (msg) try { await msg.delete(); } catch {}
                 this.thinkingMessages.delete(sessionId);
-              }
-            } catch (e: any) { console.error('[session-manager] status error:', e.message); }
-            break;
-          }
-
-          case 'permission.asked': {
-            if (!projectSession || !this.discordClient) break;
-            const props = (event as any).properties;
-            try {
-              const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
-              const thinkingMsg = this.thinkingMessages.get(sessionId);
-              if (thinkingMsg) try { await thinkingMsg.edit(`🔐 **${projectSession.projectName}** 等待權限確認...`); } catch {}
-
-              if (projectSession.autoApproved.has(props.permission)) {
-                await this.opencodeClient!.permission.reply({ requestID: props.id, reply: 'once' });
-              } else {
-                const permissionInfo = {
-                permission: props.permission || 'Unknown',
-                patterns: props.patterns,
-                metadata: props.metadata,
-              };
-              const result = await postApprovalAndWait(channel, props.permission || 'Unknown', permissionInfo, 60_000);
-                console.log(`[session-manager] Permission result:`, result);
-                const reply = result.decision === 'allow' ? (result.autoApprove ? 'always' : 'once') : 'reject';
-                console.log(`[session-manager] Sending permission reply: ${reply} for ${props.id}`);
-                await this.opencodeClient!.permission.reply({ requestID: props.id, reply });
-                console.log(`[session-manager] Permission reply sent successfully`);
-                if (result.autoApprove) projectSession.autoApproved.add(props.permission);
-              }
-
-              if (thinkingMsg) try { await thinkingMsg.edit(`🤔 **${projectSession.projectName}** 思考中...`); } catch {}
-            } catch (e: any) { console.error('[session-manager] permission error:', e.message); }
-            break;
-          }
-
-          case 'message.part.delta': {
-            if (!projectSession || !this.discordClient) break;
-            const props = (event as any).properties;
-            // Support both old format (props.part.text) and new format (props.delta with props.field === 'text')
-            const deltaText = props?.delta || (props?.part?.type === 'text' ? props?.part?.text : null);
-            const isTextDelta = props?.field === 'text' || props?.part?.type === 'text';
-            if (isTextDelta && deltaText) {
-              console.log(`[session-manager] Delta text received: ${deltaText.slice(0, 50)}...`);
-              if (!messageBuffers.has(sessionId)) {
-                try {
-                  const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
-                  messageBuffers.set(sessionId, { text: '', lastSentAt: 0, lastMessage: null, channel });
-                } catch { break; }
-              }
-              const buffer = messageBuffers.get(sessionId)!;
-              buffer.text += deltaText;
-              // Only flush if buffer is getting close to Discord's 2000 char limit
-              // Otherwise wait for message.updated to flush complete message
-              if (buffer.text.length >= 1800) {
-                await this.flushBuffer(buffer);
+                messageBuffers.delete(sessionId);
+                break;
               }
             }
-            break;
           }
-
-          case 'message.updated': {
-            const props = (event as any).properties;
-            const info = props?.info || props?.message;
-            const isAssistant = info?.role === 'assistant';
-            const isCompleted = info?.time?.completed != null;
-            
-            console.log('[session-manager] message.updated DEBUG:', { 
-              hasProjectSession: !!projectSession, 
-              sessionId, 
-              isAssistant, 
-              isCompleted,
-              bufferExists: messageBuffers.has(sessionId),
-              bufferSize: messageBuffers.get(sessionId)?.text?.length ?? 0
-            });
-            
-            if (!projectSession) break;
-            
-            // Only flush when the assistant message is fully completed (has completed timestamp)
-            if (isAssistant && isCompleted) {
-              const buffer = messageBuffers.get(sessionId);
-              console.log('[session-manager] FLUSHING! Buffer size:', buffer?.text?.length ?? 0);
-              if (buffer && buffer.text.length > 0) {
-                await this.flushBuffer(buffer);
-                console.log('[session-manager] Buffer flushed successfully');
-              }
-              messageBuffers.delete(sessionId);
-            }
-            break;
-          }
-
-          case 'session.error': {
-            if (!projectSession || !this.discordClient) break;
-            const props = (event as any).properties;
-            try {
-              const channel = await this.discordClient.channels.fetch(projectSession.lastActiveChannel) as TextChannel;
-              await channel.send(`❌ Session error: ${props?.error || 'Unknown error'}`);
-            } catch {}
-            const msg = this.thinkingMessages.get(sessionId);
-            if (msg) try { await msg.delete(); } catch {}
-            this.thinkingMessages.delete(sessionId);
-            messageBuffers.delete(sessionId);
-            break;
-          }
+        } catch (error: any) {
+          console.error(`[session-manager] [${projectName}] Event listener error:`, error.message);
         }
-      }
+      })();
     } catch (error: any) {
-      console.error('[session-manager] Event listener error:', error.message);
-      this.eventProcessing = false;
+      console.error(`[session-manager] [${projectName}] Failed to subscribe to events:`, error.message);
     }
   }
 
@@ -211,7 +335,14 @@ console.log(`[session-manager] Status value: ${status}`);
   }
 
   async sendMessage(projectName: string, project: ProjectConfig, text: string, channel: TextChannel): Promise<void> {
-    if (!this.opencodeClient) { await channel.send('❌ OpenCode SDK not initialized'); return; }
+    // Get or create project server
+    let ps: ProjectServer;
+    try {
+      ps = await this.getOrCreateProjectServer(projectName, project.path);
+    } catch (error: any) {
+      await channel.send(`❌ Failed to start OpenCode server: ${error.message}`);
+      return;
+    }
 
     let session = this.sessions.get(projectName);
     if (session) {
@@ -228,18 +359,18 @@ console.log(`[session-manager] Status value: ${status}`);
       opencodeSessionId = session.sessionId;
     } else if (savedSession) {
       try {
-        await this.opencodeClient.session.get({ sessionID: savedSession.sessionId });
+        await ps.client.session.get({ sessionID: savedSession.sessionId });
         opencodeSessionId = savedSession.sessionId;
         console.log(`[session-manager] Resumed session ${opencodeSessionId} for ${projectName}`);
       } catch {
-        const result = await this.opencodeClient.session.create({ title: `Discord: ${projectName}`, directory: project.path });
+        const result = await ps.client.session.create({ title: `Discord: ${projectName}` });
         if (!result.data?.id) { await channel.send('❌ Failed to create session'); return; }
         opencodeSessionId = result.data.id;
         console.log(`[session-manager] Created new session ${opencodeSessionId} for ${projectName}`);
       }
     } else {
       try {
-        const result = await this.opencodeClient.session.create({ title: `Discord: ${projectName}`, directory: project.path });
+        const result = await ps.client.session.create({ title: `Discord: ${projectName}` });
         if (!result.data?.id) { await channel.send('❌ Failed to create session'); return; }
         opencodeSessionId = result.data.id;
         console.log(`[session-manager] Created new session ${opencodeSessionId} for ${projectName}`);
@@ -268,7 +399,7 @@ console.log(`[session-manager] Status value: ${status}`);
         sessionID: opencodeSessionId,
         parts: [{ type: 'text', text }],
       };
-      
+
       // Add model if configured
       if (project.model) {
         const [providerID, modelID] = project.model.split('/');
@@ -276,13 +407,13 @@ console.log(`[session-manager] Status value: ${status}`);
           promptOptions.model = { providerID, modelID };
         }
       }
-      
+
       // Add agent if configured
       if (project.agent) {
         promptOptions.agent = project.agent;
       }
-      
-      await this.opencodeClient.session.promptAsync(promptOptions);
+
+      await ps.client.session.promptAsync(promptOptions);
     } catch (err: any) {
       if (err.name === 'AbortError') return;
       await channel.send(`❌ Session error: ${err.message}`);
@@ -312,13 +443,25 @@ console.log(`[session-manager] Status value: ${status}`);
     this.sessions.delete(projectName);
     this.queueSave();
     console.log(`[session-manager] Closed session for ${projectName}`);
+
+    // Close project server if no more sessions for this project
+    const ps = this.projectServers.get(projectName);
+    if (ps) {
+      ps.close();
+      console.log(`[session-manager] Closed OpenCode server for ${projectName}`);
+    }
   }
 
   async closeAll(): Promise<void> {
     const names = [...this.sessions.keys()];
     await Promise.all(names.map((n) => this.closeSession(n)));
-    this.eventProcessing = false;
-    if (this.opencodeServer) { this.opencodeServer.close(); console.log('[session-manager] OpenCode server closed'); }
+
+    // Close all remaining project servers
+    for (const [name, ps] of this.projectServers) {
+      ps.close();
+      console.log(`[session-manager] Closed OpenCode server for ${name}`);
+    }
+    this.projectServers.clear();
   }
 
   getActiveSessions(): Array<{ projectName: string; lastActiveChannel: string; idleMinutes: number; }> {
@@ -334,38 +477,40 @@ console.log(`[session-manager] Status value: ${status}`);
       console.log(`[session-manager] No active session for ${projectName}`);
       return;
     }
-    
+
     console.log(`[session-manager] Aborting session for ${projectName}`);
-    
+
     // Abort any pending operations
     session.abortController.abort();
-    
+
     // Delete thinking message if present
     const msg = this.thinkingMessages.get(session.sessionId);
     if (msg) {
       try { await msg.delete(); } catch {}
       this.thinkingMessages.delete(session.sessionId);
     }
-    
+
     // Try to cancel the session in OpenCode
-    if (this.opencodeClient) {
+    const ps = this.projectServers.get(projectName);
+    if (ps) {
       try {
-        await this.opencodeClient.session.abort({ sessionID: session.sessionId });
+        await ps.client.session.abort({ sessionID: session.sessionId });
         console.log(`[session-manager] Aborted OpenCode session ${session.sessionId}`);
       } catch (e: any) {
         console.log(`[session-manager] Could not cancel session: ${e.message}`);
       }
     }
-    
+
     // Close the session
     await this.closeSession(projectName);
   }
 
   async clearSession(projectName: string): Promise<void> {
     const session = this.sessions.get(projectName);
-    if (session && this.opencodeClient) {
+    const ps = this.projectServers.get(projectName);
+    if (session && ps) {
       try {
-        await this.opencodeClient.session.delete({ sessionID: session.sessionId });
+        await ps.client.session.delete({ sessionID: session.sessionId });
         console.log(`[session-manager] Deleted session ${session.sessionId}`);
       } catch (e: any) { console.error('[session-manager] Failed to delete session:', e.message); }
     }
@@ -379,30 +524,31 @@ console.log(`[session-manager] Status value: ${status}`);
    */
   async getSessionStatus(projectName: string): Promise<SessionStatusInfo> {
     const session = this.sessions.get(projectName);
-    
-    if (!session || !this.opencodeClient) {
+    const ps = this.projectServers.get(projectName);
+
+    if (!session || !ps) {
       return { status: 'idle', todos: [] };
     }
-    
+
     try {
       // Get session info
-      const sessionInfo = await this.opencodeClient.session.get({
+      const sessionInfo = await ps.client.session.get({
         sessionID: session.sessionId,
       });
-      
+
       // Determine status
       let status: SessionStatusInfo['status'] = 'unknown';
       if (sessionInfo.data) {
-        const hasActiveMessage = session.lastActivityAt && 
+        const hasActiveMessage = session.lastActivityAt &&
           (Date.now() - session.lastActivityAt < 30000);
         status = hasActiveMessage ? 'busy' : 'idle';
       }
-      
+
       // Get todos from session
-      const messages = await this.opencodeClient.session.messages({
+      const messages = await ps.client.session.messages({
         sessionID: session.sessionId,
       });
-      
+
       // Extract todos from the latest assistant message
       let todos: SessionStatusInfo['todos'] = [];
       if (messages.data) {
@@ -418,12 +564,11 @@ console.log(`[session-manager] Status value: ${status}`);
           }
         }
       }
-      
+
       return { status, todos };
     } catch (e: any) {
       console.error('[session-manager] Failed to get session status:', e.message);
       return { status: 'unknown', todos: [] };
     }
   }
-
 }
