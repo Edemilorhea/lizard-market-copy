@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 import { loadConfig, buildChannelMap } from "./config";
 import { SessionManager } from "./session-manager";
+import { formatSessionStatus } from "./status-commands";
 import type { OrchestratorConfig } from "./types";
 
 export type OpsMessageHandler = (msg: Message) => Promise<void>;

@@ -1,8 +1,9 @@
-﻿import { createOpencode, type OpencodeClient } from '@opencode-ai/sdk/v2';
+import { createOpencode, type OpencodeClient } from '@opencode-ai/sdk/v2';
 import type { Client, TextChannel, Message } from 'discord.js';
 import type { ActiveSession, ProjectConfig, SessionsState } from './types';
 import { loadSessions, saveSessions } from './config';
 import { postApprovalAndWait } from './approval';
+import type { SessionStatusInfo } from './status-commands';
 
 export class SessionManager {
   private sessions = new Map<string, ActiveSession>();
@@ -353,4 +354,57 @@ console.log(`[session-manager] Status value: ${status}`);
     delete this.savedSessions[projectName];
     this.queueSave();
   }
+
+  /**
+   * Get session status and todos for a project
+   */
+  async getSessionStatus(projectName: string): Promise<SessionStatusInfo> {
+    const session = this.sessions.get(projectName);
+    
+    if (!session || !this.opencodeClient) {
+      return { status: 'idle', todos: [] };
+    }
+    
+    try {
+      // Get session info
+      const sessionInfo = await this.opencodeClient.session.get({
+        sessionID: session.sessionId,
+      });
+      
+      // Determine status
+      let status: SessionStatusInfo['status'] = 'unknown';
+      if (sessionInfo.data) {
+        const hasActiveMessage = session.lastActivityAt && 
+          (Date.now() - session.lastActivityAt < 30000);
+        status = hasActiveMessage ? 'busy' : 'idle';
+      }
+      
+      // Get todos from session
+      const messages = await this.opencodeClient.session.messages({
+        sessionID: session.sessionId,
+      });
+      
+      // Extract todos from the latest assistant message
+      let todos: SessionStatusInfo['todos'] = [];
+      if (messages.data) {
+        for (let i = messages.data.length - 1; i >= 0; i--) {
+          const msg = messages.data[i] as any;
+          if (msg.role === 'assistant' && msg.todos && msg.todos.length > 0) {
+            todos = msg.todos.map((t: any) => ({
+              content: t.content || '',
+              status: t.status || 'pending',
+              priority: t.priority || 'medium',
+            }));
+            break;
+          }
+        }
+      }
+      
+      return { status, todos };
+    } catch (e: any) {
+      console.error('[session-manager] Failed to get session status:', e.message);
+      return { status: 'unknown', todos: [] };
+    }
+  }
+
 }
